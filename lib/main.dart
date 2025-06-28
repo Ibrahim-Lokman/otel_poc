@@ -1704,7 +1704,9 @@ class CheckoutScreen extends StatelessWidget {
                                       Text('Processing Payment...'),
                                     ],
                                   )
-                                : Text('Place Order'),
+                                : Text('Place Order',
+                                    style: TextStyle(
+                                        fontSize: 16, color: Colors.white)),
                           ),
                         ),
                         SizedBox(height: 8),
