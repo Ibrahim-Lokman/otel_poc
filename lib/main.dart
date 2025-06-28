@@ -6,17 +6,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:opentelemetry/api.dart' as otel;
 import 'package:opentelemetry/sdk.dart' as sdk;
-import 'package:shared_preferences/shared_preferences.dart';
+// import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
-// Global OpenTelemetry instances
+// Global instances
 late otel.Tracer globalTracer;
 late MetricsCollector metricsCollector;
-void kdebugPrint(String msg) {
-  if (kDebugMode) {
-    print(msg);
-  }
-}
+late SessionTracker sessionTracker;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -24,7 +20,207 @@ void main() async {
   // Initialize OpenTelemetry
   await initializeOpenTelemetry();
 
+  // Initialize session tracker
+  sessionTracker = SessionTracker();
+
   runApp(MyApp());
+}
+
+// Session Tracking Models
+class UserAction {
+  final String action;
+  final DateTime timestamp;
+  final Map<String, dynamic>? metadata;
+  final String? userId;
+  final String? userName;
+
+  UserAction({
+    required this.action,
+    required this.timestamp,
+    this.metadata,
+    this.userId,
+    this.userName,
+  });
+}
+
+class UserSession {
+  final String sessionId;
+  final String userId;
+  final String userName;
+  final DateTime startTime;
+  DateTime? endTime;
+  final List<UserAction> actions;
+  bool isActive;
+
+  UserSession({
+    required this.sessionId,
+    required this.userId,
+    required this.userName,
+    required this.startTime,
+    this.endTime,
+    List<UserAction>? actions,
+    this.isActive = true,
+  }) : actions = actions ?? [];
+
+  String get duration {
+    final end = endTime ?? DateTime.now();
+    final diff = end.difference(startTime);
+    if (diff.inHours > 0) {
+      return '${diff.inHours}h ${diff.inMinutes % 60}m';
+    } else if (diff.inMinutes > 0) {
+      return '${diff.inMinutes}m ${diff.inSeconds % 60}s';
+    } else {
+      return '${diff.inSeconds}s';
+    }
+  }
+
+  String get formattedFlow {
+    return actions.map((a) => a.action).join(' → ');
+  }
+}
+
+// Session Tracker Singleton
+class SessionTracker {
+  static final SessionTracker _instance = SessionTracker._internal();
+  factory SessionTracker() => _instance;
+  SessionTracker._internal();
+
+  final List<UserSession> _sessions = [];
+  UserSession? _currentSession;
+  Timer? _inactivityTimer;
+
+  // Session timeout after 5 minutes of inactivity
+  static const _sessionTimeout = Duration(minutes: 5);
+
+  List<UserSession> get sessions => List.unmodifiable(_sessions);
+  UserSession? get currentSession => _currentSession;
+
+  void startSession(String userId, String userName) {
+    // End previous session if exists
+    if (_currentSession != null) {
+      endCurrentSession();
+    }
+
+    _currentSession = UserSession(
+      sessionId: Uuid().v4(),
+      userId: userId,
+      userName: userName,
+      startTime: DateTime.now(),
+    );
+    _sessions.add(_currentSession!);
+
+    trackAction('session_started');
+    _resetInactivityTimer();
+
+    print('📊 Session started: ${_currentSession!.sessionId} for $userName');
+  }
+
+  void endCurrentSession() {
+    if (_currentSession != null) {
+      _currentSession!.endTime = DateTime.now();
+      _currentSession!.isActive = false;
+      trackAction('session_ended');
+
+      print(
+          '📊 Session ended: ${_currentSession!.sessionId} - Duration: ${_currentSession!.duration}');
+      print('📊 User flow: ${_currentSession!.formattedFlow}');
+
+      _currentSession = null;
+      _cancelInactivityTimer();
+    }
+  }
+
+  void trackAction(String action, {Map<String, dynamic>? metadata}) {
+    if (_currentSession != null) {
+      final userAction = UserAction(
+        action: action,
+        timestamp: DateTime.now(),
+        metadata: metadata,
+        userId: _currentSession!.userId,
+        userName: _currentSession!.userName,
+      );
+
+      _currentSession!.actions.add(userAction);
+      _resetInactivityTimer();
+
+      // Also send to OpenTelemetry
+      final span = globalTracer.startSpan('user_action');
+      span.setAttributes([
+        otel.Attribute.fromString('action.type', action),
+        otel.Attribute.fromString('session.id', _currentSession!.sessionId),
+        otel.Attribute.fromString('user.id', _currentSession!.userId),
+        otel.Attribute.fromString('user.name', _currentSession!.userName),
+      ]);
+
+      if (metadata != null) {
+        metadata.forEach((key, value) {
+          if (value is String) {
+            span.setAttribute(otel.Attribute.fromString('action.$key', value));
+          } else if (value is int) {
+            span.setAttribute(otel.Attribute.fromInt('action.$key', value));
+          } else if (value is double) {
+            span.setAttribute(otel.Attribute.fromDouble('action.$key', value));
+          }
+        });
+      }
+
+      span.end();
+
+      print('📊 Action tracked: $action ${metadata ?? ''}');
+    }
+  }
+
+  void _resetInactivityTimer() {
+    _cancelInactivityTimer();
+    _inactivityTimer = Timer(_sessionTimeout, () {
+      if (_currentSession != null) {
+        print('📊 Session timeout due to inactivity');
+        endCurrentSession();
+      }
+    });
+  }
+
+  void _cancelInactivityTimer() {
+    _inactivityTimer?.cancel();
+    _inactivityTimer = null;
+  }
+
+  Map<String, dynamic> getSessionAnalytics() {
+    final totalSessions = _sessions.length;
+    final activeSessions = _sessions.where((s) => s.isActive).length;
+    final completedSessions = totalSessions - activeSessions;
+
+    // Calculate average session duration
+    final completedSessionDurations = _sessions
+        .where((s) => !s.isActive && s.endTime != null)
+        .map((s) => s.endTime!.difference(s.startTime).inSeconds.toDouble())
+        .toList();
+
+    final avgDuration = completedSessionDurations.isEmpty
+        ? 0.0
+        : completedSessionDurations.reduce((a, b) => a + b) /
+            completedSessionDurations.length;
+
+    // Most common actions
+    final actionCounts = <String, int>{};
+    for (final session in _sessions) {
+      for (final action in session.actions) {
+        actionCounts[action.action] = (actionCounts[action.action] ?? 0) + 1;
+      }
+    }
+
+    final sortedActions = actionCounts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    return {
+      'total_sessions': totalSessions,
+      'active_sessions': activeSessions,
+      'completed_sessions': completedSessions,
+      'avg_session_duration_seconds': avgDuration,
+      'most_common_actions':
+          sortedActions.take(5).map((e) => '${e.key}: ${e.value}').toList(),
+    };
+  }
 }
 
 Future<void> initializeOpenTelemetry() async {
@@ -33,7 +229,8 @@ Future<void> initializeOpenTelemetry() async {
     otel.Attribute.fromString('service.name', 'ecommerce-poc'),
     otel.Attribute.fromString('service.version', '1.0.0'),
     otel.Attribute.fromString('deployment.environment', 'development'),
-    otel.Attribute.fromString('device.platform', Platform.operatingSystem),
+    otel.Attribute.fromString('device.platform',
+        (kIsWeb) ? "Running on Web" : Platform.operatingSystem),
     otel.Attribute.fromString('app.name', 'E-Commerce POC'),
   ]);
 
@@ -54,12 +251,10 @@ Future<void> initializeOpenTelemetry() async {
   // Initialize metrics collector
   metricsCollector = MetricsCollector();
 
-  kdebugPrint('🚀 OpenTelemetry initialized successfully!');
+  print('🚀 OpenTelemetry initialized successfully!');
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MultiBlocProvider(
@@ -147,37 +342,38 @@ class MetricsCollector {
 
   void incrementCounter(String name) {
     _counters[name] = (_counters[name] ?? 0) + 1;
-    kdebugPrint('📊 Counter $name: ${_counters[name]}');
+    print('📊 Counter $name: ${_counters[name]}');
   }
 
   void setGauge(String name, double value) {
     _gauges[name] = value;
-    kdebugPrint('📈 Gauge $name: $value');
+    print('📈 Gauge $name: $value');
   }
 
   void recordResponseTime(double milliseconds) {
     _responseTimesMs.add(milliseconds);
-    kdebugPrint('⏱️ Response time: ${milliseconds}ms');
+    print('⏱️ Response time: ${milliseconds}ms');
   }
 
   double getConversionRate() {
     final viewed = _counters['products_viewed'] ?? 0;
     final orders = _counters['orders_completed'] ?? 0;
-    return viewed > 0 ? (orders / viewed) * 100 : 0.0;
+    return viewed > 0 ? (orders.toDouble() / viewed.toDouble()) * 100 : 0.0;
   }
 
   double getCartAbandonmentRate() {
     final cartUpdates = _counters['cart_updated'] ?? 0;
     final checkouts = _counters['checkout_initiated'] ?? 0;
     return cartUpdates > 0
-        ? ((cartUpdates - checkouts) / cartUpdates) * 100
+        ? ((cartUpdates - checkouts).toDouble() / cartUpdates.toDouble()) * 100
         : 0.0;
   }
 
   double getAverageResponseTime() {
     return _responseTimesMs.isEmpty
         ? 0.0
-        : _responseTimesMs.reduce((a, b) => a + b) / _responseTimesMs.length;
+        : _responseTimesMs.reduce((a, b) => a + b) /
+            _responseTimesMs.length.toDouble();
   }
 
   Map<String, dynamic> getAllMetrics() {
@@ -255,6 +451,11 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     try {
       emit(AuthLoading());
 
+      // Track login attempt
+      sessionTracker.trackAction('login_attempt', metadata: {
+        'email': event.email,
+      });
+
       // Add span attributes
       span.setAttributes([
         otel.Attribute.fromString('user.email', event.email),
@@ -279,6 +480,15 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
           demographics: userData['demographics']!,
         );
 
+        // Start new session
+        sessionTracker.startSession(user.id, user.name);
+
+        // Track successful login
+        sessionTracker.trackAction('login_success', metadata: {
+          'user_name': user.name,
+          'user_email': user.email,
+        });
+
         // Add user attributes to span
         span.setAttributes([
           otel.Attribute.fromString('user.id', user.id),
@@ -290,8 +500,13 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
         metricsCollector.incrementCounter('login_success');
 
         emit(AuthSuccess(user));
-        kdebugPrint('✅ Login Success: ${user.name} (${user.email})');
+        print('✅ Login Success: ${user.name} (${user.email})');
       } else {
+        sessionTracker.trackAction('login_failed', metadata: {
+          'email': event.email,
+          'reason': 'invalid_credentials',
+        });
+
         span.addEvent('login_failure', attributes: [
           otel.Attribute.fromString('failure.reason', 'invalid_credentials'),
         ]);
@@ -299,13 +514,13 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
 
         span.setStatus(otel.StatusCode.error, 'Invalid credentials');
         emit(AuthFailure('Invalid email or password'));
-        kdebugPrint('❌ Login Failed: Invalid credentials for ${event.email}');
+        print('❌ Login Failed: Invalid credentials for ${event.email}');
       }
     } catch (e) {
       span.recordException(e);
       span.setStatus(otel.StatusCode.error, e.toString());
       emit(AuthFailure('Login failed: $e'));
-      kdebugPrint('❌ Login Exception: $e');
+      print('❌ Login Exception: $e');
     } finally {
       span.end();
     }
@@ -317,13 +532,20 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
 
     try {
       span.addEvent('logout_initiated');
+
+      // Track logout
+      sessionTracker.trackAction('logout');
+
+      // End session
+      sessionTracker.endCurrentSession();
+
       await Future.delayed(Duration(milliseconds: 200));
 
       metricsCollector.incrementCounter('logout_success');
       span.addEvent('logout_success');
 
       emit(AuthInitial());
-      kdebugPrint('✅ Logout Success');
+      print('✅ Logout Success');
     } finally {
       span.end();
     }
@@ -421,6 +643,9 @@ class ProductBloc extends Bloc<ProductEvent, ProductState> {
     try {
       emit(ProductLoading());
 
+      // Track product catalog view
+      sessionTracker.trackAction('product_catalog_viewed');
+
       span.setAttributes([
         otel.Attribute.fromInt('products.request_count', _mockProducts.length),
       ]);
@@ -457,6 +682,11 @@ class ProductBloc extends Bloc<ProductEvent, ProductState> {
       span.setStatus(otel.StatusCode.error, e.toString());
 
       metricsCollector.incrementCounter('product_load_errors');
+
+      sessionTracker.trackAction('product_load_error', metadata: {
+        'error': e.toString(),
+      });
+
       emit(ProductError(e.toString()));
     } finally {
       span.end();
@@ -468,6 +698,14 @@ class ProductBloc extends Bloc<ProductEvent, ProductState> {
     final span = globalTracer.startSpan('product_viewed');
 
     try {
+      // Track product view
+      sessionTracker.trackAction('product_viewed', metadata: {
+        'product_id': event.product.id,
+        'product_name': event.product.name,
+        'product_price': event.product.price,
+        'product_category': event.product.category,
+      });
+
       span.setAttributes([
         otel.Attribute.fromString('product.id', event.product.id),
         otel.Attribute.fromString('product.name', event.product.name),
@@ -529,14 +767,12 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     final span = globalTracer.startSpan('add_to_cart');
 
     try {
-      // Propagate context from any existing span
-      final currentContext = otel.Context.current;
-      final parentSpan = otel.spanFromContext(currentContext);
-      if (parentSpan != null) {
-        span.setAttributes([
-          otel.Attribute.fromString('parent.operation', 'product_interaction'),
-        ]);
-      }
+      // Track add to cart action
+      sessionTracker.trackAction('add_to_cart', metadata: {
+        'product_id': event.product.id,
+        'product_name': event.product.name,
+        'product_price': event.product.price,
+      });
 
       span.setAttributes([
         otel.Attribute.fromString('product.id', event.product.id),
@@ -584,6 +820,15 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     final span = globalTracer.startSpan('remove_from_cart');
 
     try {
+      final removedItem =
+          _items.firstWhere((item) => item.product.id == event.productId);
+
+      // Track remove from cart
+      sessionTracker.trackAction('remove_from_cart', metadata: {
+        'product_id': removedItem.product.id,
+        'product_name': removedItem.product.name,
+      });
+
       _items.removeWhere((item) => item.product.id == event.productId);
       final total = _calculateTotal();
 
@@ -613,6 +858,14 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       final oldQuantity = item.quantity;
       item.quantity = event.quantity;
 
+      // Track quantity update
+      sessionTracker.trackAction('cart_quantity_updated', metadata: {
+        'product_id': item.product.id,
+        'product_name': item.product.name,
+        'old_quantity': oldQuantity,
+        'new_quantity': event.quantity,
+      });
+
       final total = _calculateTotal();
 
       span.setAttributes([
@@ -637,6 +890,11 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       _items.clear();
       _abandonmentTimer?.cancel();
 
+      // Track cart clear
+      sessionTracker.trackAction('cart_cleared', metadata: {
+        'items_cleared': itemCount,
+      });
+
       span.setAttributes([
         otel.Attribute.fromInt('items.cleared', itemCount),
       ]);
@@ -657,6 +915,12 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     _abandonmentTimer?.cancel();
     _abandonmentTimer = Timer(Duration(minutes: 5), () {
       final span = globalTracer.startSpan('cart_abandoned');
+
+      // Track cart abandonment
+      sessionTracker.trackAction('cart_abandoned', metadata: {
+        'abandoned_items': _items.length,
+        'abandoned_value': _calculateTotal(),
+      });
 
       span.setAttributes([
         otel.Attribute.fromInt('cart.abandoned_items', _items.length),
@@ -698,7 +962,6 @@ class CheckoutFailure extends CheckoutState {
   CheckoutFailure(this.error);
 }
 
-// Fixed CheckoutBloc with proper state emissions
 class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
   CheckoutBloc() : super(CheckoutInitial()) {
     on<InitiateCheckout>(_onInitiateCheckout);
@@ -710,6 +973,9 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
     final span = globalTracer.startSpan('checkout_initiated');
 
     try {
+      // Track checkout initiation
+      sessionTracker.trackAction('checkout_initiated');
+
       span.addEvent('checkout_process_started');
       metricsCollector.incrementCounter('checkout_initiated');
 
@@ -727,6 +993,12 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
     try {
       // IMPORTANT: Emit loading state immediately
       emit(CheckoutLoading());
+
+      // Track payment attempt
+      sessionTracker.trackAction('payment_attempted', metadata: {
+        'total_amount': event.total,
+        'item_count': event.items.length,
+      });
 
       parentSpan.setAttributes([
         otel.Attribute.fromInt('order.item_count', event.items.length),
@@ -761,6 +1033,13 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
               timestamp: DateTime.now(),
             );
 
+            // Track successful order
+            sessionTracker.trackAction('order_completed', metadata: {
+              'order_id': order.id,
+              'order_total': order.total,
+              'item_count': order.items.length,
+            });
+
             orderSpan.setAttributes([
               otel.Attribute.fromString('order.id', order.id),
               otel.Attribute.fromString(
@@ -772,13 +1051,20 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
 
             // Emit success state
             emit(CheckoutSuccess(order));
-            kdebugPrint('✅ Checkout Success - Order ID: ${order.id}');
+            print('✅ Checkout Success - Order ID: ${order.id}');
           } finally {
             orderSpan.end();
           }
         } else {
           // Payment failure
           final error = 'Payment failed: Card declined';
+
+          // Track payment failure
+          sessionTracker.trackAction('payment_failed', metadata: {
+            'reason': 'card_declined',
+            'total_amount': event.total,
+          });
+
           paymentSpan.recordException(Exception(error));
           paymentSpan.setStatus(otel.StatusCode.error, error);
 
@@ -790,7 +1076,7 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
 
           // Emit failure state
           emit(CheckoutFailure(error));
-          kdebugPrint('❌ Checkout Failed: $error');
+          print('❌ Checkout Failed: $error');
         }
       } finally {
         paymentSpan.end();
@@ -801,7 +1087,7 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
 
       // Emit failure state for any exceptions
       emit(CheckoutFailure('Checkout failed: $e'));
-      kdebugPrint('❌ Checkout Exception: $e');
+      print('❌ Checkout Exception: $e');
     } finally {
       parentSpan.end();
     }
@@ -810,8 +1096,6 @@ class CheckoutBloc extends Bloc<CheckoutEvent, CheckoutState> {
 
 // UI Screens
 class AuthWrapper extends StatelessWidget {
-  const AuthWrapper({super.key});
-
   @override
   Widget build(BuildContext context) {
     return BlocBuilder<AuthBloc, AuthState>(
@@ -826,8 +1110,6 @@ class AuthWrapper extends StatelessWidget {
 }
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
-
   @override
   _LoginScreenState createState() => _LoginScreenState();
 }
@@ -947,8 +1229,6 @@ class _LoginScreenState extends State<LoginScreen> {
 }
 
 class ProductListScreen extends StatelessWidget {
-  const ProductListScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -957,7 +1237,10 @@ class ProductListScreen extends StatelessWidget {
         actions: [
           IconButton(
             icon: Icon(Icons.analytics),
-            onPressed: () => Navigator.pushNamed(context, '/telemetry'),
+            onPressed: () {
+              sessionTracker.trackAction('telemetry_screen_viewed');
+              Navigator.pushNamed(context, '/telemetry');
+            },
           ),
           BlocBuilder<CartBloc, CartState>(
             builder: (context, state) {
@@ -966,7 +1249,10 @@ class ProductListScreen extends StatelessWidget {
                 children: [
                   IconButton(
                     icon: Icon(Icons.shopping_cart),
-                    onPressed: () => Navigator.pushNamed(context, '/cart'),
+                    onPressed: () {
+                      sessionTracker.trackAction('cart_viewed');
+                      Navigator.pushNamed(context, '/cart');
+                    },
                   ),
                   if (itemCount > 0)
                     Positioned(
@@ -1120,8 +1406,6 @@ class ProductListScreen extends StatelessWidget {
 }
 
 class CartScreen extends StatelessWidget {
-  const CartScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1215,6 +1499,8 @@ class CartScreen extends StatelessWidget {
                         ),
                         ElevatedButton(
                           onPressed: () {
+                            sessionTracker
+                                .trackAction('checkout_button_clicked');
                             context
                                 .read<CheckoutBloc>()
                                 .add(InitiateCheckout());
@@ -1235,19 +1521,13 @@ class CartScreen extends StatelessWidget {
   }
 }
 
-// CheckoutScreen with debugging
 class CheckoutScreen extends StatelessWidget {
-  const CheckoutScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text('Checkout')),
       body: BlocConsumer<CheckoutBloc, CheckoutState>(
         listener: (context, state) {
-          // Debug output
-          kdebugPrint('🔍 CheckoutScreen received state: ${state.runtimeType}');
-
           if (state is CheckoutSuccess) {
             // Clear cart after successful order
             context.read<CartBloc>().add(ClearCart());
@@ -1319,9 +1599,6 @@ class CheckoutScreen extends StatelessWidget {
           }
         },
         builder: (context, checkoutState) {
-          kdebugPrint(
-              '🔍 CheckoutScreen builder state: ${checkoutState.runtimeType}');
-
           return BlocBuilder<CartBloc, CartState>(
             builder: (context, cartState) {
               if (cartState is! CartUpdated || cartState.items.isEmpty) {
@@ -1399,8 +1676,6 @@ class CheckoutScreen extends StatelessWidget {
                             onPressed: checkoutState is CheckoutLoading
                                 ? null
                                 : () {
-                                    kdebugPrint(
-                                        '🔍 Place Order button pressed');
                                     context.read<CheckoutBloc>().add(
                                           ProcessPayment(
                                               cartState.items, cartState.total),
@@ -1434,19 +1709,9 @@ class CheckoutScreen extends StatelessWidget {
                         ),
                         SizedBox(height: 8),
                         Center(
-                          child: Column(
-                            children: [
-                              Text(
-                                'Payment simulation: 70% success rate',
-                                style:
-                                    TextStyle(fontSize: 12, color: Colors.grey),
-                              ),
-                              Text(
-                                'Current state: ${checkoutState.runtimeType}',
-                                style:
-                                    TextStyle(fontSize: 10, color: Colors.blue),
-                              ),
-                            ],
+                          child: Text(
+                            'Payment simulation: 70% success rate',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
                           ),
                         ),
                       ],
@@ -1489,17 +1754,208 @@ class CheckoutScreen extends StatelessWidget {
 }
 
 class TelemetryDebugScreen extends StatelessWidget {
-  const TelemetryDebugScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
+    final sessions = sessionTracker.sessions;
+    final currentSession = sessionTracker.currentSession;
+    final analytics = sessionTracker.getSessionAnalytics();
+
     return Scaffold(
-      appBar: AppBar(title: Text('OpenTelemetry Debug')),
+      appBar: AppBar(title: Text('OpenTelemetry & Session Debug')),
       body: SingleChildScrollView(
         padding: EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Current Session Card
+            if (currentSession != null)
+              Card(
+                color: Colors.green[50],
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.circle, color: Colors.green, size: 12),
+                          SizedBox(width: 8),
+                          Text(
+                            'Current Session',
+                            style: TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 8),
+                      Text('User: ${currentSession.userName}'),
+                      Text(
+                          'Session ID: ${currentSession.sessionId.substring(0, 8)}...'),
+                      Text('Duration: ${currentSession.duration}'),
+                      SizedBox(height: 8),
+                      Text(
+                        'User Flow:',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      Container(
+                        margin: EdgeInsets.only(top: 8),
+                        padding: EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.green[200]!),
+                        ),
+                        child: Text(
+                          currentSession.formattedFlow.isEmpty
+                              ? 'No actions yet'
+                              : currentSession.formattedFlow,
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            SizedBox(height: 16),
+
+            // Session Analytics
+            Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '📊 Session Analytics',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(height: 16),
+                    _buildMetricTile(
+                        'Total Sessions', '${analytics['total_sessions']}'),
+                    _buildMetricTile(
+                        'Active Sessions', '${analytics['active_sessions']}'),
+                    _buildMetricTile('Completed Sessions',
+                        '${analytics['completed_sessions']}'),
+                    _buildMetricTile('Avg Session Duration',
+                        '${(analytics['avg_session_duration_seconds'] as num).toStringAsFixed(0)}s'),
+                    SizedBox(height: 8),
+                    Text('Most Common Actions:',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    if ((analytics['most_common_actions'] as List).isNotEmpty)
+                      ...(analytics['most_common_actions'] as List)
+                          .map((action) => Padding(
+                                padding: EdgeInsets.only(left: 16, top: 4),
+                                child: Text('• $action',
+                                    style: TextStyle(fontSize: 12)),
+                              ))
+                    else
+                      Padding(
+                        padding: EdgeInsets.only(left: 16, top: 4),
+                        child: Text('No actions recorded yet',
+                            style: TextStyle(fontSize: 12, color: Colors.grey)),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+            SizedBox(height: 16),
+
+            // Previous Sessions
+            Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '📝 Session History',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    SizedBox(height: 16),
+                    if (sessions.isEmpty)
+                      Text('No sessions recorded yet')
+                    else
+                      ...sessions.reversed.take(5).map((session) => Container(
+                            margin: EdgeInsets.only(bottom: 16),
+                            padding: EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: session.isActive
+                                  ? Colors.green[50]
+                                  : Colors.grey[100],
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: session.isActive
+                                    ? Colors.green[200]!
+                                    : Colors.grey[300]!,
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    if (session.isActive)
+                                      Icon(Icons.circle,
+                                          color: Colors.green, size: 10),
+                                    if (session.isActive) SizedBox(width: 4),
+                                    Text(
+                                      'Session ${sessions.indexOf(session) + 1} - ${session.userName}',
+                                      style: TextStyle(
+                                          fontWeight: FontWeight.bold),
+                                    ),
+                                    Spacer(),
+                                    Text(
+                                      session.duration,
+                                      style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.grey[600]),
+                                    ),
+                                  ],
+                                ),
+                                SizedBox(height: 4),
+                                Text(
+                                  'Start: ${_formatTime(session.startTime)}',
+                                  style: TextStyle(
+                                      fontSize: 11, color: Colors.grey[600]),
+                                ),
+                                if (!session.isActive &&
+                                    session.endTime != null)
+                                  Text(
+                                    'End: ${_formatTime(session.endTime!)}',
+                                    style: TextStyle(
+                                        fontSize: 11, color: Colors.grey[600]),
+                                  ),
+                                SizedBox(height: 8),
+                                Text(
+                                  'User Flow:',
+                                  style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold),
+                                ),
+                                SizedBox(height: 4),
+                                Text(
+                                  session.formattedFlow.isEmpty
+                                      ? 'No actions recorded'
+                                      : session.formattedFlow,
+                                  style: TextStyle(fontSize: 11),
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          )),
+                  ],
+                ),
+              ),
+            ),
+
+            SizedBox(height: 16),
+
+            // Real-time Metrics Card
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16),
@@ -1522,7 +1978,10 @@ class TelemetryDebugScreen extends StatelessWidget {
                 ),
               ),
             ),
+
             SizedBox(height: 16),
+
+            // Raw Metrics Data
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16),
@@ -1551,7 +2010,10 @@ class TelemetryDebugScreen extends StatelessWidget {
                 ),
               ),
             ),
+
             SizedBox(height: 16),
+
+            // OpenTelemetry Features Card
             Card(
               child: Padding(
                 padding: EdgeInsets.all(16),
@@ -1559,13 +2021,15 @@ class TelemetryDebugScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '🔍 OpenTelemetry Features Demonstrated',
+                      '🔍 OpenTelemetry Features',
                       style:
                           TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                     ),
                     SizedBox(height: 16),
                     _buildFeatureTile('✅ Distributed Tracing',
                         'User journey spans across BLoCs'),
+                    _buildFeatureTile(
+                        '✅ Session Tracking', 'Complete user flow monitoring'),
                     _buildFeatureTile('✅ Custom Events',
                         'login_attempt, product_viewed, cart_updated, etc.'),
                     _buildFeatureTile(
@@ -1576,8 +2040,6 @@ class TelemetryDebugScreen extends StatelessWidget {
                         'Parent-child span relationships'),
                     _buildFeatureTile('✅ Resource Attributes',
                         'App version, device info, user demographics'),
-                    _buildFeatureTile('✅ Span Processors',
-                        'Batch and simple span processors'),
                     _buildFeatureTile('✅ Console Exporter',
                         'Check console for detailed span output'),
                   ],
@@ -1588,6 +2050,10 @@ class TelemetryDebugScreen extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  String _formatTime(DateTime time) {
+    return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}:${time.second.toString().padLeft(2, '0')}';
   }
 
   Widget _buildMetricTile(String title, String value) {
@@ -1621,6 +2087,14 @@ class TelemetryDebugScreen extends StatelessWidget {
   }
 
   String _formatMetrics(Map<String, dynamic> metrics) {
-    return metrics.entries.map((e) => '${e.key}: ${e.value}').join('\n');
+    return metrics.entries.map((e) {
+      var value = e.value;
+      if (value is double) {
+        value = value.toStringAsFixed(2);
+      } else if (value is Map || value is List) {
+        value = value.toString();
+      }
+      return '${e.key}: $value';
+    }).join('\n');
   }
 }
